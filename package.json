@@ -1,0 +1,44 @@
+{
+  "name": "tech-realty-rentals",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tech Realty Rentals multi-tenant homebuyer and mortgage lead platform (specification-driven monorepo)",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "workspaces": [
+    "packages/shared",
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "dev:api": "npm run dev -w @tech-realty-rentals/api",
+    "dev:web": "npm run dev -w @tech-realty-rentals/web",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d postgres",
+    "db:generate": "npm run prisma:generate -w @tech-realty-rentals/api",
+    "db:migrate": "npm run prisma:migrate:deploy -w @tech-realty-rentals/api",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.2",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "globals": "^15.14.0",
+    "prettier": "^3.4.2",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "^8.19.0"
+  },
+  "overrides": {
+    "@swc/core": "1.10.1"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules
+dist
+coverage
+package-lock.json
+apps/api/prisma/migrations
+apps/web/e2e/.auth
+apps/web/playwright-report
+apps/web/test-results
+docs
+CLAUDE.md
+README.md

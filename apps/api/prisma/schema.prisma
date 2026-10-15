@@ -1,0 +1,750 @@
+// Phase 1 schema: identity and tenancy foundation (docs/03 §2).
+// Phase 2 adds authentication/session/audit models below.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrganizationType {
+  PLATFORM
+  AGENT_ORG
+  LENDER_ORG
+}
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum AccountStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  DISABLED
+}
+
+enum MembershipStatus {
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+// Roles per docs/02 §2. HOMEBUYER users are org-less saved-scenario users, so they hold
+// no Membership; the role is reserved here for later phases.
+enum Role {
+  PLATFORM_ADMIN
+  PLATFORM_SUPPORT
+  AGENT_ADMIN
+  AGENT_MEMBER
+  LENDER_ADMIN
+  LENDER_MEMBER
+  COMPLIANCE_REVIEWER
+}
+
+model User {
+  id                      String                   @id @default(uuid()) @db.Uuid
+  // Normalized (trimmed, lower-cased) by the service layer before write.
+  email                   String                   @unique
+  passwordHash            String?                  @map("password_hash")
+  emailVerifiedAt         DateTime?                @map("email_verified_at") @db.Timestamptz(3)
+  status                  AccountStatus            @default(PENDING_VERIFICATION)
+  createdAt               DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(3)
+  memberships             Membership[]
+  refreshTokens           RefreshToken[]
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]
+  auditEvents             AuditEvent[]
+
+  @@map("users")
+}
+
+model Organization {
+  id                String             @id @default(uuid()) @db.Uuid
+  name              String
+  type              OrganizationType
+  status            OrganizationStatus @default(ACTIVE)
+  createdAt         DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  memberships       Membership[]
+  auditEvents       AuditEvent[]
+  widgets           Widget[]
+  attributionEvents AttributionEvent[]
+  leads             Lead[]
+  leadRelationships LeadRelationship[]
+  lender            Lender?
+
+  @@index([type, createdAt])
+  @@map("organizations")
+}
+
+model Membership {
+  id             String           @id @default(uuid()) @db.Uuid
+  userId         String           @map("user_id") @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  role           Role
+  status         MembershipStatus @default(ACTIVE)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  user           User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId, createdAt])
+  @@map("memberships")
+}
+
+// --- Phase 2: authentication, session and audit (docs/02 §5-6, docs/03 §2) ---
+
+enum AuditOutcome {
+  SUCCESS
+  FAILURE
+  DENIED
+}
+
+// Rotating refresh credential. Only a SHA-256 hash of the opaque token value is stored
+// (docs/03 §2: "hashed token/identifier"); the raw value exists only in the HttpOnly cookie.
+// `familyId` links a login's full rotation chain so that presenting an already-rotated
+// (reused/stolen) token can revoke the whole chain, not just itself.
+model RefreshToken {
+  id           String        @id @default(uuid()) @db.Uuid
+  userId       String        @map("user_id") @db.Uuid
+  tokenHash    String        @unique @map("token_hash")
+  familyId     String        @map("family_id") @db.Uuid
+  expiresAt    DateTime      @map("expires_at") @db.Timestamptz(3)
+  revokedAt    DateTime?     @map("revoked_at") @db.Timestamptz(3)
+  // Points at the token that replaced this one when rotated; null if never rotated.
+  replacedById String?       @unique @map("replaced_by_id") @db.Uuid
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  replacedBy   RefreshToken? @relation("RefreshTokenRotation", fields: [replacedById], references: [id])
+  replacedFrom RefreshToken? @relation("RefreshTokenRotation")
+
+  @@index([userId, createdAt])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+// Local/mock email-verification token (docs/02 §5). Only the SHA-256 hash is stored; the
+// raw value is handed to the EmailProvider adapter, which -- until a real provider is
+// approved -- only logs/stores it locally (CLAUDE.md §3, §7).
+model EmailVerificationToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(3)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  user       User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@map("email_verification_tokens")
+}
+
+// Password-reset token. Same hashing/adapter approach as EmailVerificationToken.
+model PasswordResetToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(3)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  user       User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@map("password_reset_tokens")
+}
+
+// Audit-event foundation (docs/02 §6). `metadata` must only ever contain safe, non-PII,
+// non-secret fields -- enforced in application code (AuditService), not at the schema level.
+// actorUserId/organizationId are nullable and SetNull on delete so audit history outlives
+// the identities it references (audit records are never deleted when an actor is removed).
+model AuditEvent {
+  id             String        @id @default(uuid()) @db.Uuid
+  actorUserId    String?       @map("actor_user_id") @db.Uuid
+  organizationId String?       @map("organization_id") @db.Uuid
+  action         String
+  resourceType   String?       @map("resource_type")
+  resourceId     String?       @map("resource_id")
+  outcome        AuditOutcome
+  correlationId  String        @map("correlation_id")
+  metadata       Json?
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  actor          User?         @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([actorUserId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_events")
+}
+
+// --- Phase 4: agent widgets and public attribution (docs/03 §2, docs/06) ---
+
+enum WidgetStatus {
+  ACTIVE
+  PAUSED
+}
+
+// Subset of Phase 3's three calculators that a widget may enable (docs/06 §2).
+enum CalculatorType {
+  AFFORDABILITY
+  PROPERTY_COST
+  RENT_VS_BUY
+}
+
+// Mirrors the dot-notation values in packages/shared/src/widgets.ts (`widget.viewed`,
+// `calculator.completed`) -- Prisma enum members cannot contain `.`, so the API layer maps
+// between the two forms. A closed set by design (docs/06 §5): never an arbitrary client string.
+enum AttributionEventType {
+  WIDGET_VIEWED
+  CALCULATOR_COMPLETED
+}
+
+// Agent-organization-owned embeddable widget configuration (docs/03 §2, docs/06 §2).
+// `publicKey` is a random, non-secret, URL-safe opaque token -- deliberately NOT the UUID
+// primary key, so the key can be rotated without ever needing to change `id` (docs/06 §4;
+// see packages/shared/src/widgets.ts). `configVersion` increments on every config-changing
+// update (docs/10 §2 "Changes are auditable and have a configuration version").
+model Widget {
+  id                 String             @id @default(uuid()) @db.Uuid
+  organizationId     String             @map("organization_id") @db.Uuid
+  publicKey          String             @unique @map("public_key")
+  name               String
+  themePrimaryColor  String             @map("theme_primary_color")
+  themeLogoUrl       String?            @map("theme_logo_url")
+  allowedOrigins     String[]           @map("allowed_origins")
+  enabledCalculators CalculatorType[]   @map("enabled_calculators")
+  status             WidgetStatus       @default(ACTIVE)
+  configVersion      Int                @default(1) @map("config_version")
+  createdAt          DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  organization       Organization       @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  attributionEvents  AttributionEvent[]
+  leads              Lead[]
+  consentRecords     ConsentRecord[]
+  idempotencyKeys    LeadIdempotencyKey[]
+
+  @@index([organizationId, createdAt])
+  @@map("widgets")
+}
+
+// Minimal, privacy-safe source-context record (docs/03 §2, docs/06 §5). No fingerprinting:
+// no device/browser/IP fields are captured here at all. `organizationId` is denormalized from
+// the owning widget at write time purely so agent-scoped queries/indexes never need to join
+// through Widget (docs/02 §4 "Add organization_id filters to every tenant-scoped query").
+model AttributionEvent {
+  id             String               @id @default(uuid()) @db.Uuid
+  widgetId       String               @map("widget_id") @db.Uuid
+  organizationId String               @map("organization_id") @db.Uuid
+  eventType      AttributionEventType @map("event_type")
+  campaign       String?
+  source         String?
+  landingPath    String?              @map("landing_path")
+  occurredAt     DateTime             @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  widget         Widget               @relation(fields: [widgetId], references: [id], onDelete: Restrict)
+  organization   Organization         @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, occurredAt])
+  @@index([widgetId, occurredAt])
+  @@index([eventType, occurredAt])
+  @@map("attribution_events")
+}
+
+// --- Phase 5: consent, lead capture and lead CRM (docs/03 §2, docs/07, docs/08, docs/11 §6) ---
+//
+// LEGAL NOTICE (CLAUDE.md §4, docs/07 §1): nothing here is legal advice. Disclosure content
+// seeded against `DisclosureVersion` is SYNTHETIC PLACEHOLDER copy, not reviewed or approved
+// by qualified US counsel. Credit pulls, income verification, and SSN/bank-credential/full-
+// credit-report fields are permanently out of scope and none exist on any model below.
+//
+// `LeadStatus` models the full MVP-documented status set (docs/08 §1) so this schema does
+// not need to change again in Phase 6, but Phase 5's domain service
+// (packages/shared/src/leads.ts `assertLeadTransitionAllowed`, used by
+// apps/api/src/leads/lead-lifecycle.service.ts) only allows NEW -> {NEEDS_REVIEW, SUPPRESSED,
+// CLOSED} and NEEDS_REVIEW -> CLOSED; every other status is reachable only once Phase 6's
+// routing/delivery/qualification capabilities exist.
+
+enum LeadStatus {
+  NEW
+  NEEDS_REVIEW
+  ELIGIBLE
+  ROUTING
+  DELIVERED
+  ACCEPTED
+  REJECTED
+  SUPPRESSED
+  CLOSED
+}
+
+enum ConsentPurpose {
+  SAVE_RESULTS
+  RATE_ALERTS
+  LENDER_CONTACT
+}
+
+enum ConsentChannel {
+  ACCOUNT
+  EMAIL
+  PHONE
+}
+
+// Informational metadata only in Phase 5 (no authoring/approval workflow exists yet) --
+// every seeded row is PENDING_COUNSEL_REVIEW; "active" resolution (disclosures.service.ts)
+// checks publishedAt/retiredAt only, NOT this field. See the Phase 5 final report's residual
+// risks: production use requires wiring real counsel approval as a hard gate here.
+enum DisclosureReviewStatus {
+  PENDING_COUNSEL_REVIEW
+  APPROVED
+}
+
+enum LeadRelationshipType {
+  SOURCE_ORGANIZATION
+}
+
+enum LeadEventType {
+  LEAD_CREATED
+  LEAD_MATCHED_EXISTING
+  CONSENT_RECORDED
+  CONSENT_REVOKED
+  SUPPRESSION_BLOCKED
+  STATUS_CHANGED
+  // --- Phase 6 additions (docs/08, docs/11 §7) ---
+  QUALIFICATION_PASSED
+  QUALIFICATION_FAILED
+  ROUTING_STARTED
+  ROUTING_FAILED
+  DELIVERY_ATTEMPTED
+  DELIVERY_ACKNOWLEDGED
+  DELIVERY_REJECTED
+  DELIVERY_RECONCILIATION_PENDING
+  DELIVERY_RECONCILED
+  LENDER_ACKNOWLEDGED
+  BILLING_ENTRY_CREATED
+}
+
+// Phase 6 addition to purchaseIntent (docs/08 §4 "buyer status" — an approved, non-sensitive
+// routing criterion; packages/shared/src/leads.ts `BuyerStatus`).
+enum BuyerStatus {
+  FIRST_TIME_BUYER
+  REPEAT_BUYER
+  INVESTOR
+  UNSPECIFIED
+}
+
+enum SuppressionReason {
+  USER_REQUESTED
+  COMPLAINT
+  BOUNCE
+  LEGAL_HOLD
+  SEED_PLACEHOLDER
+}
+
+// Versioned, immutable disclosure copy (docs/07 §4). Never updated in place once published --
+// retire (`retiredAt`) and insert a new row for a new version. `contentHash` is a SHA-256 hex
+// digest of `content`, computed once at seed/authoring time, so a consent event's recorded
+// hash can be verified against this row forever (docs/07 §3).
+model DisclosureVersion {
+  id             String                  @id @default(uuid()) @db.Uuid
+  purpose        ConsentPurpose
+  locale         String                  @default("en-US")
+  version        Int
+  content        String
+  contentHash    String                  @map("content_hash")
+  reviewStatus   DisclosureReviewStatus  @default(PENDING_COUNSEL_REVIEW) @map("review_status")
+  publishedAt    DateTime?               @map("published_at") @db.Timestamptz(3)
+  retiredAt      DateTime?               @map("retired_at") @db.Timestamptz(3)
+  createdAt      DateTime                @default(now()) @map("created_at") @db.Timestamptz(3)
+  consentRecords ConsentRecord[]
+
+  @@unique([purpose, locale, version])
+  @@index([purpose, locale, publishedAt, retiredAt])
+  @@map("disclosure_versions")
+}
+
+// Canonical lead record (docs/03 §2). `contactEmail`/`contactPhone` hold the normalized
+// (lower-cased / digit-normalized) protected contact identifiers; `emailMatchToken`/
+// `phoneMatchToken` hold the keyed-HMAC dedup lookup tokens (docs/03 §5) -- lookups join on
+// the token columns, never on the raw contact columns, so a database-level index never
+// exposes a plaintext-comparable structure for low-entropy identifiers. Encryption-at-rest
+// for `contactEmail`/`contactPhone` beyond Postgres's own storage-level encryption is a
+// documented residual item for a production threat-model review (CLAUDE.md §3 "Keep
+// sensitive fields separate ... encrypt ... as required by the threat model"), not
+// implemented in Phase 5.
+model Lead {
+  id                     String               @id @default(uuid()) @db.Uuid
+  contactEmail           String?              @map("contact_email")
+  contactPhone           String?              @map("contact_phone")
+  emailMatchToken        String?              @map("email_match_token")
+  phoneMatchToken        String?              @map("phone_match_token")
+  status                 LeadStatus           @default(NEW)
+  sourceWidgetId         String               @map("source_widget_id") @db.Uuid
+  sourceOrganizationId   String               @map("source_organization_id") @db.Uuid
+  purchaseIntentTimeline String?              @map("purchase_intent_timeline")
+  purchaseIntentState    String?              @map("purchase_intent_state")
+  purchaseIntentZip      String?              @map("purchase_intent_zip")
+  purchaseIntentPriceMin Int?                 @map("purchase_intent_price_min")
+  purchaseIntentPriceMax Int?                 @map("purchase_intent_price_max")
+  // Phase 6 addition (docs/08 §4) — additive, optional; null means "not provided", resolved
+  // to UNSPECIFIED by the service layer before being used as a routing-match input so routing
+  // never has to special-case null (see RoutingService).
+  purchaseIntentBuyerStatus BuyerStatus?      @map("purchase_intent_buyer_status")
+  retentionUntil         DateTime?            @map("retention_until") @db.Timestamptz(3)
+  createdAt              DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+  sourceWidget           Widget               @relation(fields: [sourceWidgetId], references: [id], onDelete: Restrict)
+  sourceOrganization     Organization         @relation(fields: [sourceOrganizationId], references: [id], onDelete: Restrict)
+  relationships          LeadRelationship[]
+  consentRecords         ConsentRecord[]
+  events                 LeadEvent[]
+  idempotencyKeys        LeadIdempotencyKey[]
+  qualificationRecords   QualificationRecord[]
+  routingAttempts        RoutingAttempt[]
+  deliveries             LeadDelivery[]
+
+  @@index([status, createdAt])
+  @@index([emailMatchToken])
+  @@index([phoneMatchToken])
+  @@index([sourceOrganizationId, createdAt])
+  @@map("leads")
+}
+
+// Which organization(s) may view a lead, and how (docs/03 §2). Phase 5 only ever creates one
+// relationship per lead -- the widget's owning (source) agent organization -- but the model
+// is kept generic so Phase 6 (e.g. a delivered-to lender's own visibility) does not require a
+// schema change.
+model LeadRelationship {
+  id               String               @id @default(uuid()) @db.Uuid
+  leadId           String               @map("lead_id") @db.Uuid
+  organizationId   String               @map("organization_id") @db.Uuid
+  relationshipType LeadRelationshipType @default(SOURCE_ORGANIZATION) @map("relationship_type")
+  createdAt        DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  lead             Lead                 @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  organization     Organization         @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@unique([leadId, organizationId, relationshipType])
+  @@index([organizationId, createdAt])
+  @@map("lead_relationships")
+}
+
+// One row per purpose actually granted (docs/07 §2-3: never one record covering multiple
+// purposes). `evidenceMetadata` must only ever contain safe, non-PII fields (same discipline
+// as AuditEvent.metadata) -- enforced in application code, not at the schema level.
+model ConsentRecord {
+  id                  String            @id @default(uuid()) @db.Uuid
+  leadId              String            @map("lead_id") @db.Uuid
+  disclosureVersionId String            @map("disclosure_version_id") @db.Uuid
+  purpose             ConsentPurpose
+  channel             ConsentChannel
+  recipientScope      String?           @map("recipient_scope")
+  userAction          String            @default("GRANTED") @map("user_action")
+  capturedAt          DateTime          @default(now()) @map("captured_at") @db.Timestamptz(3)
+  sourceWidgetId       String           @map("source_widget_id") @db.Uuid
+  correlationId        String           @map("correlation_id")
+  evidenceMetadata     Json?            @map("evidence_metadata")
+  revokedAt            DateTime?        @map("revoked_at") @db.Timestamptz(3)
+  revokedReason        String?          @map("revoked_reason")
+  lead                 Lead             @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  disclosureVersion    DisclosureVersion @relation(fields: [disclosureVersionId], references: [id], onDelete: Restrict)
+  sourceWidget         Widget           @relation(fields: [sourceWidgetId], references: [id], onDelete: Restrict)
+
+  @@index([leadId, capturedAt])
+  @@index([purpose, channel])
+  @@map("consent_records")
+}
+
+// Append-only lead history (docs/03 §2). `metadata` must only ever contain safe, non-PII
+// fields -- same discipline as AuditEvent.metadata.
+model LeadEvent {
+  id            String        @id @default(uuid()) @db.Uuid
+  leadId        String        @map("lead_id") @db.Uuid
+  eventType     LeadEventType @map("event_type")
+  actorType     String        @default("SYSTEM") @map("actor_type")
+  correlationId String        @map("correlation_id")
+  metadata      Json?
+  occurredAt    DateTime      @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  lead          Lead          @relation(fields: [leadId], references: [id], onDelete: Restrict)
+
+  @@index([leadId, occurredAt])
+  @@map("lead_events")
+}
+
+// Suppression lookup is keyed-HMAC-token based, same as Lead dedup (docs/03 §2 "Restrict
+// access"). No raw contact value is ever stored here.
+model SuppressionRecord {
+  id         String            @id @default(uuid()) @db.Uuid
+  matchToken String            @map("match_token")
+  purpose    ConsentPurpose
+  channel    ConsentChannel
+  reason     SuppressionReason
+  source     String
+  createdAt  DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([matchToken, purpose, channel])
+  @@map("suppression_records")
+}
+
+// Idempotency ledger for `POST /api/v1/public/leads` (docs/04 §1, docs/08 §6). Scoped per
+// widget (a public key is the natural partition for an anonymous caller, mirroring how an
+// API-key-scoped idempotency key works elsewhere) -- the same key value reused under a
+// different widget is treated as a distinct key. `requestHash` is a SHA-256 digest of the
+// canonicalized request body, used only to detect "same key, different payload" (409); it is
+// not a secret and stores no reversible PII beyond what hashing already implies.
+model LeadIdempotencyKey {
+  id               String   @id @default(uuid()) @db.Uuid
+  widgetId         String   @map("widget_id") @db.Uuid
+  idempotencyKey   String   @map("idempotency_key")
+  requestHash      String   @map("request_hash")
+  leadId           String?  @map("lead_id") @db.Uuid
+  responseSnapshot Json     @map("response_snapshot")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  widget           Widget   @relation(fields: [widgetId], references: [id], onDelete: Restrict)
+  lead             Lead?    @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  @@unique([widgetId, idempotencyKey])
+  @@map("lead_idempotency_keys")
+}
+
+// --- Phase 6: exclusive lender delivery, mock routing/delivery adapter and simulated billing
+// ledger (docs/03 §2 "Qualification and marketplace", docs/08, docs/11 §7). ---
+//
+// CRITICAL, repeated from CLAUDE.md and docs/11 Gate 6: real lender delivery and real payment
+// processing remain disabled unless separately authorized. `LenderIntegrationMode` below has
+// exactly one member (`MOCK`) so a "real" integration mode can never even be selected at the
+// schema level. Every lender/routing policy row in this phase is SYNTHETIC seed data (see
+// apps/api/src/delivery/lender-catalog-seed.service.ts) -- no real lender onboarding,
+// contract or credential exists.
+
+enum QualificationType {
+  CONTACT_FORMAT
+  EMAIL_VERIFICATION
+  PHONE_VERIFICATION
+}
+
+enum QualificationStatus {
+  PENDING
+  PASSED
+  FAILED
+}
+
+// Provenance tag identifying which (mock) check produced a QualificationRecord -- never a
+// real credit/income provider (CLAUDE.md §4, docs/08 §3).
+enum QualificationProvider {
+  SYNTACTIC_VALIDATOR
+  MOCK_EMAIL_VERIFICATION
+  MOCK_PHONE_VERIFICATION
+}
+
+enum LenderIntegrationMode {
+  MOCK
+}
+
+enum LenderStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum RoutingStrategy {
+  EXCLUSIVE
+}
+
+enum RoutingPolicyStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum RoutingAttemptStatus {
+  PENDING
+  DISPATCHED
+  FAILED
+}
+
+enum RoutingFailureReason {
+  NO_ELIGIBLE_POLICY
+  CONSENT_NOT_GRANTED
+  LENDER_NOT_APPROVED
+}
+
+enum DeliveryStatus {
+  PENDING
+  ACKNOWLEDGED
+  REJECTED
+  RECONCILIATION_PENDING
+  FAILED
+}
+
+// Closed rejection/failure reason-code enum (docs/08 §7) -- never free-text, never PII.
+enum DeliveryRejectionReason {
+  INVALID_CONTACT
+  OUTSIDE_TERRITORY
+  DUPLICATE_UNDER_CONTRACT
+  UNSUPPORTED_REQUEST
+  TECHNICAL_FAILURE
+}
+
+enum BillingEventType {
+  LEAD_DELIVERY_FEE
+}
+
+enum BillingEntryStatus {
+  POSTED
+}
+
+// MVP qualification: syntactic validation plus an OPTIONAL mock email/phone verification step
+// (docs/08 §3). No credit bureau or income verification -- permanently out of scope.
+model QualificationRecord {
+  id          String                @id @default(uuid()) @db.Uuid
+  leadId      String                @map("lead_id") @db.Uuid
+  type        QualificationType
+  provider    QualificationProvider
+  status      QualificationStatus   @default(PENDING)
+  requestedAt DateTime              @default(now()) @map("requested_at") @db.Timestamptz(3)
+  completedAt DateTime?             @map("completed_at") @db.Timestamptz(3)
+  // Minimal, non-PII result fields only (docs/03 §2 "minimal result fields") -- e.g. which
+  // syntactic rule failed, never a raw contact value.
+  resultSummary Json?               @map("result_summary")
+  correlationId String              @map("correlation_id")
+  lead        Lead                  @relation(fields: [leadId], references: [id], onDelete: Restrict)
+
+  @@index([leadId, requestedAt])
+  @@map("qualification_records")
+}
+
+// Manually configured, synthetic lender (docs/03 §2, docs/08 §4). organizationId points at a
+// LENDER_ORG Organization; `contractApprovedAt` is the SIMULATED approval flag the task
+// description calls for -- never a real contractual/legal approval. A lender must be ACTIVE
+// AND have a non-null contractApprovedAt to ever be routed to (RoutingService).
+model Lender {
+  id                 String                @id @default(uuid()) @db.Uuid
+  organizationId     String                @unique @map("organization_id") @db.Uuid
+  displayName        String                @map("display_name")
+  status             LenderStatus          @default(ACTIVE)
+  integrationMode    LenderIntegrationMode @default(MOCK) @map("integration_mode")
+  contractApprovedAt DateTime?             @map("contract_approved_at") @db.Timestamptz(3)
+  createdAt          DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+  organization       Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  routingPolicies     RoutingPolicy[]
+  routingAttempts     RoutingAttempt[]
+  deliveries          LeadDelivery[]
+
+  @@map("lenders")
+}
+
+// Manually configured exclusive routing policy (docs/03 §2, docs/08 §4). `eligibilityConditions`
+// is validated against packages/shared/src/delivery.ts `routingEligibilityConditionsSchema`
+// (`.strict()`, approved non-sensitive fields only) before every write -- there is no public
+// authoring API in Phase 6, so the only writer is the synthetic seed service, but the
+// validation step is kept anyway as a structural guarantee, not merely a convention.
+model RoutingPolicy {
+  id                     String              @id @default(uuid()) @db.Uuid
+  lenderId               String              @map("lender_id") @db.Uuid
+  strategy               RoutingStrategy     @default(EXCLUSIVE)
+  eligibilityConditions  Json                @map("eligibility_conditions")
+  // Higher priority value wins when more than one active policy matches the same lead
+  // (documented tie-break rule -- see RoutingService).
+  priority               Int                 @default(0)
+  status                 RoutingPolicyStatus @default(ACTIVE)
+  version                Int                 @default(1)
+  activeFrom             DateTime?           @map("active_from") @db.Timestamptz(3)
+  activeUntil            DateTime?           @map("active_until") @db.Timestamptz(3)
+  createdAt              DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  lender                 Lender              @relation(fields: [lenderId], references: [id], onDelete: Restrict)
+  routingAttempts        RoutingAttempt[]
+
+  @@index([lenderId, status])
+  @@map("routing_policies")
+}
+
+// Persisted BEFORE any delivery attempt (docs/08 §4 "Persist routing attempt before sending").
+// `routingPolicyId`/`lenderId` are nullable: a routing attempt whose failureReason is
+// NO_ELIGIBLE_POLICY never resolved a recipient at all, so there is nothing to point at --
+// the row still exists for traceability (docs/11 §7 acceptance criterion "every outcome is
+// traceable"), just with no recipient attached.
+model RoutingAttempt {
+  id              String                @id @default(uuid()) @db.Uuid
+  leadId          String                @map("lead_id") @db.Uuid
+  routingPolicyId String?               @map("routing_policy_id") @db.Uuid
+  policyVersion   Int?                  @map("policy_version")
+  lenderId        String?               @map("lender_id") @db.Uuid
+  status          RoutingAttemptStatus  @default(PENDING)
+  failureReason   RoutingFailureReason? @map("failure_reason")
+  idempotencyKey  String                @unique @map("idempotency_key")
+  correlationId   String                @map("correlation_id")
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  completedAt     DateTime?             @map("completed_at") @db.Timestamptz(3)
+  lead            Lead                  @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  routingPolicy   RoutingPolicy?        @relation(fields: [routingPolicyId], references: [id], onDelete: Restrict)
+  lender          Lender?               @relation(fields: [lenderId], references: [id], onDelete: Restrict)
+  delivery        LeadDelivery?
+
+  @@index([leadId, createdAt])
+  @@map("routing_attempts")
+}
+
+// The mock delivery adapter's attempt record (docs/03 §2, docs/08 §5-6). One row per
+// RoutingAttempt (1:1) -- a retried delivery (same idempotency key, same payload) updates
+// this same row rather than inserting a new one, which is what makes "exactly one BillingEntry
+// per successful delivery" provable at the schema level (unique [leadDeliveryId] on
+// BillingEntry) rather than merely by service-layer discipline.
+model LeadDelivery {
+  id                   String                    @id @default(uuid()) @db.Uuid
+  leadId               String                    @map("lead_id") @db.Uuid
+  lenderId             String                    @map("lender_id") @db.Uuid
+  routingAttemptId     String                    @unique @map("routing_attempt_id") @db.Uuid
+  status               DeliveryStatus            @default(PENDING)
+  payloadVersion       Int                       @map("payload_version")
+  idempotencyKey       String                    @unique @map("idempotency_key")
+  // SHA-256 hex digest of the canonicalized delivery payload (mirrors leads.service.ts's
+  // canonical-JSON-hash pattern exactly) -- used only to detect "same key, different payload"
+  // (409 conflict), never to recover the payload itself.
+  requestHash          String                    @map("request_hash")
+  attemptedAt          DateTime                  @default(now()) @map("attempted_at") @db.Timestamptz(3)
+  // Set only when the mock provider's outcome for THIS attempt was ACKNOWLEDGED (docs/03 §2
+  // "acknowledged_at").
+  acknowledgedAt       DateTime?                 @map("acknowledged_at") @db.Timestamptz(3)
+  // Phase 6 extension beyond docs/03 §2's literal field list, documented in the final report:
+  // a second, lender-portal-driven confirmation layer, distinct from the adapter's own
+  // transmission acknowledgment above, satisfying docs/04 §2 / docs/10 §4's
+  // "POST /lender/deliveries/:id/acknowledge ... idempotent and auditable" requirement.
+  lenderAcknowledgedAt DateTime?                 @map("lender_acknowledged_at") @db.Timestamptz(3)
+  errorCode            DeliveryRejectionReason?  @map("error_code")
+  providerCorrelationId String?                  @map("provider_correlation_id")
+  retryCount            Int                      @default(0) @map("retry_count")
+  createdAt             DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime                @updatedAt @map("updated_at") @db.Timestamptz(3)
+  lead                   Lead                    @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  lender                 Lender                  @relation(fields: [lenderId], references: [id], onDelete: Restrict)
+  routingAttempt         RoutingAttempt          @relation(fields: [routingAttemptId], references: [id], onDelete: Restrict)
+  billingEntry            BillingEntry?
+
+  @@index([lenderId, createdAt])
+  @@index([leadId, createdAt])
+  @@map("lead_deliveries")
+}
+
+// Simulated billing ledger (docs/03 §2, docs/08 §8). Created ONLY on a successful/acknowledged
+// delivery, exactly once per delivery -- enforced by the unique constraint on leadDeliveryId,
+// not merely by service-layer discipline (belt-and-suspenders against the single most
+// important invariant in this phase: a retried delivery must never create a second billable
+// event). Adjustments are explicitly OUT of scope for this phase (see the final report's
+// documented deviation) -- every entry here is a POSTED original charge, never edited or
+// deleted.
+model BillingEntry {
+  id               String             @id @default(uuid()) @db.Uuid
+  leadDeliveryId   String             @unique @map("lead_delivery_id") @db.Uuid
+  eventType        BillingEventType   @default(LEAD_DELIVERY_FEE) @map("event_type")
+  amountCents      Int                @map("amount_cents")
+  currency         String             @default("USD")
+  status           BillingEntryStatus @default(POSTED)
+  // Always null -- no real payment processor is integrated (CLAUDE.md §3, docs/08 §8).
+  externalReference String?           @map("external_reference")
+  createdAt        DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  leadDelivery      LeadDelivery      @relation(fields: [leadDeliveryId], references: [id], onDelete: Restrict)
+
+  @@map("billing_entries")
+}
